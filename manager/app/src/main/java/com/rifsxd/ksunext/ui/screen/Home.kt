@@ -90,6 +90,87 @@ import java.util.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+fun runRootCommand(command: String, timeoutSeconds: Long = 3): String? {
+    return try {
+        val process = ProcessBuilder("su", "-c", command)
+            .redirectErrorStream(true)
+            .start()
+
+        if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            null
+        } else {
+            val output = process.inputStream
+                .bufferedReader()
+                .use { it.readText() }
+                .trim()
+
+            if (process.exitValue() == 0 && output.isNotEmpty()) {
+                output
+            } else {
+                null
+            }
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private data class HomeRootInfo(
+    val versionTag: String?,
+    val workingText: String?,
+    val hookType: String?,
+    val hasCustomVersion: Boolean
+)
+
+private fun getKsudVersion(): String? =
+    runRootCommand("for p in /data/adb/ksu/bin/ksud /data/adb/ksud \$(command -v ksud 2>/dev/null); do [ -x \"\$p\" ] && \"\$p\" -V && exit 0; done; exit 1")
+        ?.lineSequence()
+        ?.firstOrNull()
+        ?.replace(Regex("^ksud\\s+"), "")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { "v$it" }
+
+private suspend fun loadHomeRootInfo(isManager: Boolean): HomeRootInfo =
+    withContext(Dispatchers.IO) {
+        if (!isManager) return@withContext HomeRootInfo(null, null, null, false)
+
+        // One su spawn, one daemon handshake — reads all three files, tab-delimited.
+        val raw = runRootCommand(
+            "for f in version working hook_type; do " +
+                    "p=\"/data/local/tmp/.custom_manager/\$f\"; " +
+                    "[ -f \"\$p\" ] && printf '%s\\t%s\\n' \"\$f\" \"\$(cat \"\$p\")\"; " +
+                    "done; exit 0"
+        )
+
+        val map = raw?.lineSequence()
+            ?.mapNotNull { line -> line.split('\t', limit = 2).takeIf { it.size == 2 } }
+            ?.associate { (k, v) -> k to v.trim() }
+            .orEmpty()
+
+        val customVersion = map["version"]?.takeIf { it.isNotEmpty() }
+        val versionTag = customVersion
+            ?: try {
+                Natives.getVersionTag()
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() && it != "Unknown" }
+                    ?: getKsudVersion()
+                    ?: "Unknown"
+            } catch (_: Exception) {
+                getKsudVersion() ?: "Unknown"
+            }
+
+        HomeRootInfo(
+            versionTag = versionTag,
+            workingText = map["working"]?.takeIf { it.isNotEmpty() },
+            hookType = map["hook_type"]?.takeIf { it.isNotEmpty() },
+            hasCustomVersion = customVersion != null
+        )
+    }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Destination<RootGraph>(start = true)
@@ -101,7 +182,12 @@ fun HomeScreen(navigator: DestinationsNavigator) {
     val isManager = Natives.isManager
     val fullFeatured = Natives.isFullFeatured()
     val ksuVersion = if (isManager) Natives.version else null
-    val ksuVersionTag = if (isManager) Natives.getVersionTag() else null
+
+    val homeRootInfo by produceState<HomeRootInfo?>(initialValue = null, isManager) {
+        value = loadHomeRootInfo(isManager)
+    }
+    val ksuVersionTag = if (isManager) homeRootInfo?.versionTag else null
+
     val kernelUAPIVersion = if (isManager) Natives.kernelUAPIVersion else null
     val managerUAPIVersion = Natives.managerUAPIVersion
 
@@ -167,7 +253,9 @@ fun HomeScreen(navigator: DestinationsNavigator) {
                 ksuVersion,
                 kernelUAPIVersion,
                 lkmMode,
-                ksuVersionTagParam = ksuVersionTag
+                ksuVersionTagParam = ksuVersionTag,
+                workingText = homeRootInfo?.workingText,
+                hasCustomVersionTag = homeRootInfo?.hasCustomVersion == true
             ) {
                 navigator.navigate(InstallScreenDestination)
             }
@@ -261,7 +349,7 @@ fun HomeScreen(navigator: DestinationsNavigator) {
                 UpdateCard()
             }
 
-            InfoCard(autoExpand = developerOptionsEnabled)
+            InfoCard(autoExpand = developerOptionsEnabled, customHookType = homeRootInfo?.hookType)
             IssueReportCard()
             ContributorsCard()
             Spacer(Modifier)
@@ -753,6 +841,8 @@ private fun StatusCard(
     lkmModeParam: Boolean?,
     moduleUpdateCount: Int = 0,
     ksuVersionTagParam: String? = null,
+    workingText: String? = null,
+    hasCustomVersionTag: Boolean = false,
     onClickInstall: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -873,7 +963,7 @@ private fun StatusCard(
                             }
                         ) {
                             Text(
-                                text = stringResource(id = R.string.home_working),
+                                text = workingText ?: stringResource(id = R.string.home_working),
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold
                             )
@@ -882,9 +972,12 @@ private fun StatusCard(
                         val ksuVer = ksuVersionParam ?: 0
                         val uapiVer = uapiVerParam ?: 0
                         val tag = if (!ksuVersionTagParam.isNullOrEmpty()) ksuVersionTagParam else "v0.0.0"
+                        val versionFirstArg =
+                            if (hasCustomVersionTag && ksuVersionTagParam != null) ksuVersionTagParam
+                            else "$tag"
                         val versionText = stringResource(
                             R.string.home_working_version,
-                            tag,
+                            versionFirstArg,
                             "$ksuVer-$uapiVer"
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -973,7 +1066,7 @@ fun WarningCard(
 }
 
 @Composable
-private fun InfoCard(autoExpand: Boolean = false) {
+private fun InfoCard(autoExpand: Boolean = false, customHookType: String? = null) {
     val context = LocalContext.current
 
     val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -1054,9 +1147,9 @@ private fun InfoCard(autoExpand: Boolean = false) {
                     Spacer(Modifier.height(16.dp))
 
                     InfoCardItem(
-                        label   = stringResource(R.string.hook_mode),
-                        content = hookMode,
-                        icon    = Icons.Filled.Phishing,
+                        label = stringResource(R.string.hook_mode),
+                        customHookType ?: hookMode,
+                        icon = Icons.Filled.Phishing,
                     )
                 }
 
